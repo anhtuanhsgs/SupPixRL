@@ -28,28 +28,18 @@ from misc.Voronoi import *
 import time
 from rewards import *
 
-# python main.py --env EM_env_DEBUG_1 --gpu-id 0 1 2 3 4 5 6 7 --workers 12 --lbl-agents 2 \--num-steps 5 --max-episode-length 5 --reward normal --model DilatedUNet --merge_radius 16 --merge_speed 2 --split_radius 64 --split_speed 4  --use-lbl --size 128 128 --hidden-feat 2  --log-period 10 --features 32 64 128 256 --downsample 2 --data zebrafish
+BG = 1 # Background label
 
 class General_env (gym.Env):
     def init (self, config):
-        self.T = config ['T']
-        self.tempT = config ["tempT"]
+        self.T = config ['T'] # Number of steps
         self.size = config ["size"]
 
-        if config ["use_lbl"]:
-            self.observation_space = Box (0, 1.0, shape=[config["observation_shape"][0]] + self.size, dtype=np.float32)
-        else:
-            self.observation_space = Box (-1.0, 1.0, shape=[config["observation_shape"][0]] + self.size, dtype=np.float32)
         self.rng = np.random.RandomState(time_seed ())
-        self.max_lbl = 2 ** (self .T) - 1
+        self.max_lbl = config ['base'] ** (self .T) - 1
         self.pred_lbl2rgb = color_generator (self.max_lbl + 1)
         self.gt_lbl2rgb = color_generator (111)
         self.is3D = self.config ["3D"]
-        if self.config ["exp_pool"] > 0:
-            self.pool = []
-            self.pool_capacity = self.config ["exp_pool"]
-            self.pool_iter = 0
-            self.pool_period = 10
 
     def seed (self, seed):
         self.rng = np.random.RandomState(seed)
@@ -134,11 +124,6 @@ class General_env (gym.Env):
 
         return ret ['image'], ret ['mask']
 
-    def highres_action (self, action):
-        return cv2.resize (action, (self.size [1], self.size[0]), interpolation=cv2.INTER_NEAREST)
-
-    def lowres_reward (self, reward):
-        return block_reduce (reward, (2, 2), np.mean)
 
     def step_inference (self, action):
         if self.config ["lowres"]:
@@ -155,7 +140,7 @@ class General_env (gym.Env):
         self.mask [self.step_cnt:self.step_cnt+1] += (2 * action - 1) * 255
         self.step_cnt += 1
 
-        if self.step_cnt >= min (self.T, self.tempT):
+        if self.step_cnt >= self.T:
             done = True
 
         if self.config ["lowres"]:
@@ -267,112 +252,88 @@ class General_env (gym.Env):
         self.w_map = None
 
         # Updating information for new data point
-        if self.config ["exp_pool"] <= 0 or len (self.pool) < self.pool_capacity or self.pool_iter % self.pool_period == 0:
-            if self.config ["reward"] == "seg" and (self.type == "train" or self.is3D):
-                if not self.is3D:
-                    self.gt_lbl = relabel (reorder_label (self.gt_lbl))
+        if self.config ["reward"] == "seg" and (self.type == "train" or self.is3D):
+            unique_list = np.unique (self.gt_lbl, return_counts=True)
+            # Remove small segment
+            self.idx_list = [unique_list [0][i] for i in range (len (unique_list [0])) if unique_list [1][i] > self.config["minsize"]]
 
-                # Get all unique id from ground truth
-                unique_list = np.unique (self.gt_lbl, return_counts=True)
-                # Remove small segment
-                self.idx_list = [unique_list [0][i] for i in range (len (unique_list [0])) if unique_list [1][i] > self.config["minsize"]]
+            # Remove background
+            if 0 in self.idx_list:
+                self.idx_list.remove (0)
 
-                # Remove background
-                if 0 in self.idx_list:
-                    self.idx_list.remove (0)
+            if self.config ["rew_drop"]:
+                # Choose number of initial cells for reward calculation
+                self.keep = self.rng.choice (self.idx_list, min (self.config ["rew_drop"], len (self.idx_list)), replace=False).tolist ()
+                
+                # From the current keep list, add more neighbor cells to keeps, get boundary and cell body mask
+                for idx in np.copy (self.keep):
+                    # Dilate for boundary
+                    dilated_seg = budget_binary_dilation (self.gt_lbl==idx, self.config ["out_radius"][0], fac=self.config["dilate_fac"])
+                    # Multiply with boundary mask and get all the unique neighbors id
+                    neighbor_ids = np.unique (dilated_seg * self.gt_lbl).tolist ();
+                    # Remove background
+                    if 0 in neighbor_ids:
+                        neighbor_ids.remove (0)
+                    # Remove its self
+                    if idx in neighbor_ids:
+                        neighbor_ids.remove (idx)
+                    # Add up more neighbor cells to the list of reward calculation
+                    neighbor_ids = self.rng.choice(neighbor_ids, min (self.config ["rew_drop_2"], len (neighbor_ids)), replace=False).tolist ()
+                    # Ignore the added ones
+                    for _idx  in neighbor_ids:
+                        if not (_idx in self.keep):
+                            self.keep.append (_idx)
 
-                if self.config ["rew_drop"]:
-                    # Choose number of initial cells for reward calculation
-                    self.keep = self.rng.choice (self.idx_list, min (self.config ["rew_drop"], len (self.idx_list)), replace=False).tolist ()
-                    
-                    # From the current keep list, add more neighbor cells to keeps, get boundary and cell body mask
-                    for idx in np.copy (self.keep):
-                        # Dilate for boundary
-                        dilated_seg = budget_binary_dilation (self.gt_lbl==idx, self.config ["out_radius"][0], fac=self.config["dilate_fac"])
-                        # Multiply with boundary mask and get all the unique neighbors id
-                        neighbor_ids = np.unique (dilated_seg * self.gt_lbl).tolist ();
-                        # Remove background
-                        if 0 in neighbor_ids:
-                            neighbor_ids.remove (0)
-                        # Remove its self
-                        if idx in neighbor_ids:
-                            neighbor_ids.remove (idx)
-                        # Add up more neighbor cells to the list of reward calculation
-                        neighbor_ids = self.rng.choice(neighbor_ids, min (self.config ["rew_drop_2"], len (neighbor_ids)), replace=False).tolist ()
-                        # Ignore the added ones
-                        for _idx  in neighbor_ids:
-                            if not (_idx in self.keep):
-                                self.keep.append (_idx)
+                # Get a map of keep list
+                self.keep_map = np.isin (self.gt_lbl, self.keep)
 
-                    # Get a map of keep list
-                    self.keep_map = np.isin (self.gt_lbl, self.keep)
+                # Calculate foreground ratio
+                fg_ratio = np.count_nonzero (self.keep_map) / np.prod (self.keep_map.shape)
+                # fg_ratio = min (fg_ratio, 0.1)
+                # Sampling the ratio so that the number of sampled background pixel will be calculated for reward
+                bg_sampling_map = self.rng.choice ([False,True], self.keep_map.shape, replace=True, p=[1.0-fg_ratio, fg_ratio])
+                self.keep_map = self.keep_map | (bg_sampling_map & (self.gt_lbl == 0))
+                self.keep_map = self.keep_map.astype (np.float32)
 
-                    # Calculate foreground ratio
-                    fg_ratio = np.count_nonzero (self.keep_map) / np.prod (self.keep_map.shape)
-                    # fg_ratio = min (fg_ratio, 0.1)
-                    # Sampling the ratio so that the number of sampled background pixel will be calculated for reward
-                    bg_sampling_map = self.rng.choice ([False,True], self.keep_map.shape, replace=True, p=[1.0-fg_ratio, fg_ratio])
-                    self.keep_map = self.keep_map | (bg_sampling_map & (self.gt_lbl == 0))
-                    self.keep_map = self.keep_map.astype (np.float32)
+            # Update cells body of reward calculation list [keep]
+            self.segs = [self.gt_lbl == idx for idx in self.keep]
 
-                # Update cells body of reward calculation list [keep]
-                self.segs = [self.gt_lbl == idx for idx in self.keep]
+            self.bdrs = []
+            self.inrs = []
 
-                self.bdrs = []
-                self.inrs = []
+            # A neighbor area map from all the cells in the keep list
+            adj_map = np.zeros (self.gt_lbl.shape, dtype=np.bool)
+            for radius in self.config ["out_radius"]:
+                bdrs = []
+                for seg in self.segs:
+                    # For each cell in the keep list, get its dilated boundary
+                    bdr = seg ^ budget_binary_dilation (seg, radius, fac=self.config["dilate_fac"])
+                    # Update boundary list
+                    bdrs.append (bdr)
+                    # Update the adj map
+                    adj_map = adj_map | bdr | seg
+                self.bdrs += [bdrs]
 
-                # A neighbor area map from all the cells in the keep list
-                adj_map = np.zeros (self.gt_lbl.shape, dtype=np.bool)
-                for radius in self.config ["out_radius"]:
-                    bdrs = []
-                    for seg in self.segs:
-                        # For each cell in the keep list, get its dilated boundary
-                        bdr = seg ^ budget_binary_dilation (seg, radius, fac=self.config["dilate_fac"])
-                        # Update boundary list
-                        bdrs.append (bdr)
-                        # Update the adj map
-                        adj_map = adj_map | bdr | seg
-                    self.bdrs += [bdrs]
+            # List of neighbor to the cells in the keep list (excluding the cells in the list itself)
+            adj_list = np.unique (adj_map * self.gt_lbl).tolist ()
+            self.idx_list = copy.deepcopy (self.keep)
 
-                # List of neighbor to the cells in the keep list (excluding the cells in the list itself)
-                adj_list = np.unique (adj_map * self.gt_lbl).tolist ()
-                self.idx_list = copy.deepcopy (self.keep)
+            # Update the cells body and boundary of the just listed neighbor cells
+            for idx in adj_list:
+                # For each neighbor that is not background, and not in the copy of keep list (will be updated)
+                if idx != 0 and idx not in self.idx_list:
+                    seg = self.gt_lbl == idx
+                    # Get the bdrs and boundaries
+                    self.segs.append (seg)
+                    for i, radius in enumerate (self.config ["out_radius"]):
+                        self.bdrs [i].append (seg ^ budget_binary_dilation (seg, radius, fac=self.config["dilate_fac"]))
+                    self.idx_list.append (idx)
 
-                # Update the cells body and boundary of the just listed neighbor cells
-                for idx in adj_list:
-                    # For each neighbor that is not background, and not in the copy of keep list (will be updated)
-                    if idx != 0 and idx not in self.idx_list:
-                        seg = self.gt_lbl == idx
-                        # Get the bdrs and boundaries
-                        self.segs.append (seg)
-                        for i, radius in enumerate (self.config ["out_radius"]):
-                            self.bdrs [i].append (seg ^ budget_binary_dilation (seg, radius, fac=self.config["dilate_fac"]))
-                        self.idx_list.append (idx)
-
-                if not self.is3D:
-                    for radius in self.config ["in_radius"]:
-                        self.inrs += [[budget_binary_erosion (seg, radius, minsize=self.config["minsize"]) for seg in self.segs]]
-                else:
-                    self.inrs = [[seg for seg in self.segs]]
-
-
-                if self.config ["exp_pool"] > 0:
-                    training_sample = {}
-                    training_sample ["raw"] = self.raw 
-                    training_sample ["gt_lbl"] = self.gt_lbl  
-                    training_sample ["inrs"] = self.inrs 
-                    training_sample ["segs"] = self.segs  
-                    training_sample ["bdrs"] = self.bdrs  
-                    training_sample ["keep"] = self.keep  
-                    training_sample ["keep_map"] = self.keep_map  
-                    training_sample ["idx_list"] = self.idx_list  
-
-                    self.pool.append (training_sample)
-                    if len (self.pool) > self.pool_capacity:
-                        self.pool.pop (0)
-
-        if self.config ["exp_pool"] > 0:
-            self.pool_iter += 1
+            if not self.is3D:
+                for radius in self.config ["in_radius"]:
+                    self.inrs += [[budget_binary_erosion (seg, radius, minsize=self.config["minsize"]) for seg in self.segs]]
+            else:
+                self.inrs = [[seg for seg in self.segs]]
 
         self.random_init_lbl ()
 
@@ -503,8 +464,8 @@ class General_env (gym.Env):
         return ret
 
 class EM_env (General_env):
-    def __init__ (self, raw_list, config, type, gt_lbl_list=None, obs_format="CHW", seed=0):
-        self.type = type
+    def __init__ (self, raw_list, config, isTrain, gt_lbl_list=None, obs_format="CHW", seed=0):
+        self.isTrain = isTrain
         self.raw_list = raw_list
         self.gt_lbl_list = gt_lbl_list
         self.rng = np.random.RandomState(seed)
@@ -529,38 +490,24 @@ class EM_env (General_env):
         return ret
 
     def reset (self, model=None, gpu_id=0):
-        self.T0 = self.config ["T0"]
         self.step_cnt = 0
-        idx = self.rng.randint (0, len (self.raw_list))
-        self.raw = np.copy (np.array (self.raw_list [idx], copy=True))
 
-        if (self.gt_lbl_list is not None):
-            self.gt_lbl = np.copy(self.gt_lbl_list [idx])
+        # Randomly choose a train sample
+        image_idx = self.rng.randint (0, len (self.raw_list))
+        self.raw = np.copy (np.array (self.raw_list [image_idx], copy=True))
+
+        if (self.isTrain):
+            self.gt_lbl = np.copy(self.gt_lbl_list [image_idx])
         else:
             self.gt_lbl = np.zeros_like (self.raw)
-        columns = 2
-        rows = 2
 
-        # Sampling new data point when not using pool, pool is not full or it is pool update period
-        if self.config ["exp_pool"] <= 0 or len (self.pool) < self.pool_capacity or self.pool_iter % self.pool_period == 0:
-            self.raw, self.gt_lbl = self.aug (self.raw, self.gt_lbl)
-            self.raw, self.gt_lbl = self.random_crop (self.size, [self.raw, self.gt_lbl])
-        else:
-        # Get data point from pool, pool_iter will be updated in reset_end
-            training_sample = self.pool [self.rng.randint (0, len (self.pool))]
-            self.raw = training_sample ["raw"]
-            self.gt_lbl = training_sample ["gt_lbl"]
-            self.inrs = training_sample ["inrs"]
-            self.segs = training_sample ["segs"]
-            self.bdrs = training_sample ["bdrs"]
-            self.keep = training_sample ["keep"]
-            self.keep_map = training_sample ["keep_map"]
-            self.idx_list = training_sample ["idx_list"]
-
+        # For visualization of rewards matrix for merge and split, normlized to be mid value 128
         self.split_ratio_sum = (np.zeros (self.size, dtype=np.float32) + 0.5) * (self.gt_lbl > 0)
         self.merge_ratio_sum = (np.zeros (self.size, dtype=np.float32) + 0.5) * (self.gt_lbl > 0)
 
+        # Predict label mask T x H x W
         self.mask = np.zeros ([self.T] + self.size, dtype=np.float32)
+        # 
         self.lbl = np.zeros (self.size, dtype=np.int32)
         self.sum_reward = np.zeros (self.size, dtype=np.float32)
         self.rewards = []

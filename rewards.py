@@ -119,7 +119,7 @@ def split_reward_ins (old_lbl, lbl, gt_lbl, first_step, segs, inrs, bdrs, T, sca
         # New and Old Colored segment of cell i-th
         seg = segs [i] * lbl
         o_seg = segs [i] * old_lbl
-        # Make the inside area of old color segment, new color segment a new label (will be ignored later)
+        # Make the outside area of old color segment, new color segment a new label (ignored for reward)
         seg [True ^ segs [i]] = (2 ** T)
         o_seg [True ^ segs [i]] = (2 ** T)
         # Area of the boundary (Only the neighr segments (not background))
