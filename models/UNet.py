@@ -105,12 +105,12 @@ class UNet2D (nn.Module):
 
         self.Maxpool = nn.MaxPool2d (kernel_size=(2,2), stride=(2,2))
 
-        # self.fuse_in = nn.Sequential (
-        #     nn.Conv2d (in_channels=in_ch, out_channels=features[0], kernel_size=3, padding=1),
-        #     nn.ReLU (),
-        #     )
+        self.fuse_in = nn.Sequential (
+            nn.Conv2d (in_channels=in_ch, out_channels=features[0], kernel_size=3, padding=1),
+            nn.ReLU (),
+            )
         
-        self.fuse_in = FuseIn2(in_ch, features[0] // 2, split=split, is3D=False)
+        # self.fuse_in = FuseIn2(in_ch, features[0] // 2, split=split, is3D=False)
 
         kernel_size = 3
 
@@ -134,6 +134,7 @@ class UNet2D (nn.Module):
         self.UpConv2 = Residual_Conv(in_ch=features[0] * 2, out_ch=features[0], kernel_size=kernel_size, is3D=False)
 
     def forward(self, x):
+        
         # encoding path
         x = self.fuse_in(x)
         x1 = self.Conv1(x)

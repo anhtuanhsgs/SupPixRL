@@ -1,5 +1,6 @@
 from __future__ import print_function, division
 import os, sys, glob, time
+import cv2, random
 os.environ["OMP_NUM_THREADS"] = "1"
 import argparse
 import torch
@@ -71,7 +72,7 @@ def setup_env_conf (args):
         env_conf ["observation_shape"][0] += env_conf ["T"]
 
     # args.env += "_" + args.data
-
+    
     args.log_dir += args.data + "/" + args.env + "/"
     args.save_model_dir += args.data + "/" + args.env + "/"
     create_dir (args.save_model_dir)

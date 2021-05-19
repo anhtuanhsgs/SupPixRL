@@ -11,7 +11,6 @@ import os, sys, glob, time, warnings
 from Utils.img_aug_func import *
 from skimage.measure import label
 from skimage.filters import sobel
-from malis import rand_index 
 from sklearn.metrics import adjusted_rand_score
 import matplotlib.pyplot as plt
 from skimage.feature import canny

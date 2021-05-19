@@ -1,11 +1,10 @@
 import os, sys, glob, time, copy
 from os import sys, path
-import gym
+import cv2, random
 import numpy as np
 from collections import deque
-from gym.spaces.box import Box
 
-from skimage.measure import label, block_reduce
+from skimage.measure import label
 from skimage.morphology import disk
 from skimage.morphology import binary_dilation
 import skimage.io as io
@@ -15,26 +14,27 @@ from skimage.transform import resize as resize3D
 from Utils.utils import *
 from Utils.img_aug_func import *
 import albumentations as A
-import cv2
-import random
-from gym.spaces import Box, Discrete, Tuple
+
 import matplotlib.pyplot as plt
-from malis import rand_index 
 from random import shuffle
 from PIL import Image, ImageFilter
 from utils import guassian_weight_map, density_map, malis_rand_index, malis_f1_score, adjusted_rand_index
 from skimage.draw import line_aa
 from misc.Voronoi import *
 import time
-from rewards import *
+from rewards import split_reward_fn, merge_reward_fn
+from super_pixel import RAG
 
 BG = 1 # Background label
+DEBUG_T = 2 # Initialize coloring for the first DEBUG_T steps
 
-class General_env (gym.Env):
+class General_env ():
     def init (self, config):
+        print (config)
+
         self.T = config ['T'] # Number of steps
         self.size = config ["size"]
-
+        self.base = config ['base']
         self.rng = np.random.RandomState(time_seed ())
         self.max_lbl = config ['base'] ** (self .T) - 1
         self.pred_lbl2rgb = color_generator (self.max_lbl + 1)
@@ -124,91 +124,67 @@ class General_env (gym.Env):
 
         return ret ['image'], ret ['mask']
 
-
     def step_inference (self, action):
-        if self.config ["lowres"]:
-            action = self.highres_action (action)
+        action = np.concatenate ([0], action)
         self.action = action
+        nd_action = self.rag.vec2img (action)
         
-        self.new_lbl = self.lbl + action * (2 ** self.step_cnt)
+        self.new_lbl = self.lbl + action * (self.base ** self.step_cnt)
         self.lbl = self.new_lbl
         done = False
         info = {}
         reward = np.zeros (self.size, dtype=np.float32)
 
         
-        self.mask [self.step_cnt:self.step_cnt+1] += (2 * action - 1) * 255
+        self.mask [self.step_cnt:self.step_cnt+1] += (2 * nd_action / (self.base - 1) - 1) * 255
         self.step_cnt += 1
 
         if self.step_cnt >= self.T:
             done = True
 
-        if self.config ["lowres"]:
-            reward = self.lowres_reward (reward)
         ret = (self.observation (), reward, done, info)
         return ret
 
     def step (self, action):
-
-        if self.config ["lowres"]:
-            action = self.highres_action (action)
+        # action should be a 1D list of size n_segments [0-Base]
+        # make action list to have n_segments + 1 (label start from 1)
+        action = np.concatenate (([0], action), axis=0)
         self.action = action
-        
-        self.new_lbl = self.lbl + action * (2 ** self.step_cnt)
+        nd_action = self.rag.vec2img (action)
+
+        self.new_lbl = self.lbl + action * (self.base ** self.step_cnt)
         done = False
 
-        self.mask [self.step_cnt:self.step_cnt+1] += (2 * action - 1) * 255
+        # Normalize to [-255, 255]: (2 * x - max_x) - 1 * 255
+        self.mask [self.step_cnt:self.step_cnt+1] += (2 * nd_action / (self.base - 1) - 1) * 255
         info = {}
 
-        if (self.step_cnt == 0):
-            reward = self.first_step_reward ()
-            self.lbl = self.new_lbl
-            self.step_cnt += 1
-            self.rewards.append (reward)    
-            self.sum_reward += reward
-            if self.config ["lowres"]:
-                reward = self.lowres_reward (reward)
-            ret = (self.observation (), reward, done, info)
-            return ret
+        # Initialize the reward map
+        reward = np.zeros (self.n_segments + 1, dtype=np.float32)
 
-        reward = np.zeros (self.size, dtype=np.float32)
-
-        # reward += self.foreground_reward (self.step_cnt>=self.T)
-        reward += self.background_reward (False)
+        #TODO: add reward for background
+        # reward += self.background_reward (False)
         
-        split_reward = np.zeros (self.size, dtype=np.float32)
-        merge_reward = np.zeros (self.size, dtype=np.float32)
-        split_reward_inr = np.zeros (self.size, dtype=np.float32)
+        split_reward = np.zeros (self.n_segments + 1, dtype=np.float32)
+        merge_reward = np.zeros (self.n_segments + 1, dtype=np.float32)
 
-        merge_ratio = np.zeros (self.size, dtype=np.float32)
-        split_ratio = np.zeros (self.size, dtype=np.float32)
+        merge_ratio = np.zeros (self.n_segments + 1, dtype=np.float32)
+        split_ratio = np.zeros (self.n_segments + 1, dtype=np.float32)
 
-        range_split = 2.0 * 2 * len (self.bdrs) * self.config ["spl_w"] 
-        range_merge = 2.0 * 2 * len (self.inrs) * self.config ["mer_w"] 
+        # Max value, only used to normlize visualization iamge of split/merge ratios
+        range_split = 1.0 * 2 * self.config ["spl_w"] 
+        range_merge = 1.0 * 2 * self.config ["mer_w"] 
 
-        if self.config ["reward"] == "seg":
-            scaler = None
-            # print (len (self.bdrs [1]), len (self.bdrs [0]), len (np.unique (self.gt_lbl)), len (self.segs), len (self.inrs))
-            # while (True):
-            #     pass
-            for i in range (len (self.bdrs)):
-                if self.config ["split"] == 'prox':
-                    split_reward += split_reward_s (self.lbl, self.new_lbl, self.gt_lbl, self.step_cnt==0, 
-                        self.inrs [0], self.inrs [0], self.bdrs [i], self.T, scaler, self.idx_list, self.keep)
-                if self.config ["split"] == 'ins':
-                    split_reward += split_reward_ins (self.lbl, self.new_lbl, self.gt_lbl, self.step_cnt==0, 
-                        self.inrs [0], self.inrs [0], self.bdrs [i], self.T, scaler, self.idx_list, self.keep)
-            for i in range (len (self.inrs)):
-                merge_reward += merge_reward_s (self.lbl, self.new_lbl, self.gt_lbl, self.step_cnt==0, 
-                    self.segs, self.inrs [i], self.bdrs [0], self.T, scaler, self.idx_list, self.keep)
-                # merge_reward += merge_reward_step (action, self.gt_lbl, self.step_cnt==0, self.segs, self.inrs [0], self.bdrs [0], self.T, scaler, self.idx_list)
-            # merge_reward += merge_pen_action (action, self.gt_lbl, self.step_cnt==0, self.segs, self.inrs [0], self.bdrs [0], self.T, scaler)
-            # split_reward += split_rew_action (action, self.gt_lbl, self.step_cnt==0, self.segs, self.inrs [0], self.bdrs [0], self.T, scaler)
-            
-            # split_reward_inr += split_reward_s_onlyInr (self.lbl, self.new_lbl, self.gt_lbl, self.step_cnt==0, self.inrs, self.inrs, self.bdrs, self.T, scaler)
-            reward += self.config ["spl_w"] * split_reward + self.config ["mer_w"] * merge_reward #+ split_reward * merge_reward`
-            merge_ratio += ((merge_reward ) / range_merge) * (self.gt_lbl > 0)
-            split_ratio += ((split_reward ) / range_split) * (self.gt_lbl > 0)
+
+        # Update split rewards
+        split_reward += split_reward_fn (self.lbl, self.new_lbl, self.rag, self.step_cnt, self.T)
+
+        # Update merge rewards
+        merge_reward += merge_reward_fn (self.lbl, self.new_lbl, self.rag, self.step_cnt, self.T)
+
+        reward += self.config ["spl_w"] * split_reward + self.config ["mer_w"] * merge_reward #+ split_reward * merge_reward`
+        merge_ratio += merge_reward / range_merge 
+        split_ratio += split_reward / range_split
 
         self.split_ratio_sum = self.split_ratio_sum + split_ratio
         self.merge_ratio_sum = self.merge_ratio_sum + merge_ratio
@@ -219,186 +195,80 @@ class General_env (gym.Env):
         #Reward
         self.rewards.append (reward)    
         self.sum_reward += reward
-        if self.step_cnt >= min (self.tempT, self.T):
+        if self.step_cnt >= self.T:
             done = True
-        if self.config ["lowres"]:
-            reward = self.lowres_reward (reward)
         ret = (self.observation (), reward, done, info)
         return ret
 
-    def unique (self):
-        return np.unique (self.lbl, return_counts=True)
-
     def random_init_lbl (self):
-        if (self.T0 == 0):
+        # Randomly initialize DEBUG_T steps
+        if (DEBUG_T == 0):
             return
-        action = self.gt_lbl > 0
-        self.step (action)
-        for t in range (1, self.T0):
-            action = np.zeros_like (self.lbl)
-            for i in np.unique (self.gt_lbl):
-                if i == 0:
-                    continue
-                action += (self.gt_lbl == i) * self.rng.randint (0, 2)
-            if self.type == "train":
-                self.step (action)
-            else:
-                self.step_inference (action)
+        for t in range (DEBUG_T):
+            action = np.zeros (self.n_segments, dtype=np.int32)
+            for ins_segments in self.rag.instances:
+                act = self.rng.randint (self.base)
+                for seg_idx in ins_segments:
+                    action [seg_idx-1] = act
+
+            self.step (action)
+
 
     def reset_end (self):
         """
-            Must call after reset
+            Call after custom reset func for initialization of edges and graph
         """
-        self.w_map = None
+        self.rag = RAG (self.config, self.raw, self.gt_lbl, self.config['n_segments'], compactness=0.1, split_r=self.config['split_r'])
+        # Segment index count from 1   
+        self.n_segments = self.rag.n_segments 
+        # Prediction base-10 label (for visisualize and final result) [n_segments]
+        self.lbl = np.zeros (self.n_segments + 1, dtype=np.int32)
 
-        # Updating information for new data point
-        if self.config ["reward"] == "seg" and (self.type == "train" or self.is3D):
-            unique_list = np.unique (self.gt_lbl, return_counts=True)
-            # Remove small segment
-            self.idx_list = [unique_list [0][i] for i in range (len (unique_list [0])) if unique_list [1][i] > self.config["minsize"]]
+        # Predict base-k label mask T x H x W
+        self.mask = np.zeros ([self.T] + self.size, dtype=np.float32)
+        self.rewards = []
 
-            # Remove background
-            if 0 in self.idx_list:
-                self.idx_list.remove (0)
+        # For visualization of rewards matrix for merge and split, normlized to be mid value 128
+        self.split_ratio_sum = (np.zeros (self.n_segments + 1, dtype=np.float32) + 0.5)
+        self.merge_ratio_sum = (np.zeros (self.n_segments + 1, dtype=np.float32) + 0.5)
 
-            if self.config ["rew_drop"]:
-                # Choose number of initial cells for reward calculation
-                self.keep = self.rng.choice (self.idx_list, min (self.config ["rew_drop"], len (self.idx_list)), replace=False).tolist ()
-                
-                # From the current keep list, add more neighbor cells to keeps, get boundary and cell body mask
-                for idx in np.copy (self.keep):
-                    # Dilate for boundary
-                    dilated_seg = budget_binary_dilation (self.gt_lbl==idx, self.config ["out_radius"][0], fac=self.config["dilate_fac"])
-                    # Multiply with boundary mask and get all the unique neighbors id
-                    neighbor_ids = np.unique (dilated_seg * self.gt_lbl).tolist ();
-                    # Remove background
-                    if 0 in neighbor_ids:
-                        neighbor_ids.remove (0)
-                    # Remove its self
-                    if idx in neighbor_ids:
-                        neighbor_ids.remove (idx)
-                    # Add up more neighbor cells to the list of reward calculation
-                    neighbor_ids = self.rng.choice(neighbor_ids, min (self.config ["rew_drop_2"], len (neighbor_ids)), replace=False).tolist ()
-                    # Ignore the added ones
-                    for _idx  in neighbor_ids:
-                        if not (_idx in self.keep):
-                            self.keep.append (_idx)
-
-                # Get a map of keep list
-                self.keep_map = np.isin (self.gt_lbl, self.keep)
-
-                # Calculate foreground ratio
-                fg_ratio = np.count_nonzero (self.keep_map) / np.prod (self.keep_map.shape)
-                # fg_ratio = min (fg_ratio, 0.1)
-                # Sampling the ratio so that the number of sampled background pixel will be calculated for reward
-                bg_sampling_map = self.rng.choice ([False,True], self.keep_map.shape, replace=True, p=[1.0-fg_ratio, fg_ratio])
-                self.keep_map = self.keep_map | (bg_sampling_map & (self.gt_lbl == 0))
-                self.keep_map = self.keep_map.astype (np.float32)
-
-            # Update cells body of reward calculation list [keep]
-            self.segs = [self.gt_lbl == idx for idx in self.keep]
-
-            self.bdrs = []
-            self.inrs = []
-
-            # A neighbor area map from all the cells in the keep list
-            adj_map = np.zeros (self.gt_lbl.shape, dtype=np.bool)
-            for radius in self.config ["out_radius"]:
-                bdrs = []
-                for seg in self.segs:
-                    # For each cell in the keep list, get its dilated boundary
-                    bdr = seg ^ budget_binary_dilation (seg, radius, fac=self.config["dilate_fac"])
-                    # Update boundary list
-                    bdrs.append (bdr)
-                    # Update the adj map
-                    adj_map = adj_map | bdr | seg
-                self.bdrs += [bdrs]
-
-            # List of neighbor to the cells in the keep list (excluding the cells in the list itself)
-            adj_list = np.unique (adj_map * self.gt_lbl).tolist ()
-            self.idx_list = copy.deepcopy (self.keep)
-
-            # Update the cells body and boundary of the just listed neighbor cells
-            for idx in adj_list:
-                # For each neighbor that is not background, and not in the copy of keep list (will be updated)
-                if idx != 0 and idx not in self.idx_list:
-                    seg = self.gt_lbl == idx
-                    # Get the bdrs and boundaries
-                    self.segs.append (seg)
-                    for i, radius in enumerate (self.config ["out_radius"]):
-                        self.bdrs [i].append (seg ^ budget_binary_dilation (seg, radius, fac=self.config["dilate_fac"]))
-                    self.idx_list.append (idx)
-
-            if not self.is3D:
-                for radius in self.config ["in_radius"]:
-                    self.inrs += [[budget_binary_erosion (seg, radius, minsize=self.config["minsize"]) for seg in self.segs]]
-            else:
-                self.inrs = [[seg for seg in self.segs]]
-
+        # Accumulate reward map
+        self.sum_reward = np.zeros (self.n_segments + 1, dtype=np.float32)
         self.random_init_lbl ()
 
-    def first_step_reward (self, density=None):
-        reward = np.zeros (self.size, dtype=np.float32)
-        st_foregr_ratio = self.config ["st_fgbg_ratio"]
-        reward += ((self.new_lbl != 0) & (self.gt_lbl != 0)) * (1.0 - st_foregr_ratio)
-        reward += ((self.new_lbl == 0) & (self.gt_lbl == 0)) * (st_foregr_ratio)
-        reward -= ((self.new_lbl == 0) & (self.gt_lbl != 0)) * (1.0 - st_foregr_ratio)
-        reward -= ((self.new_lbl != 0) & (self.gt_lbl == 0)) * (st_foregr_ratio)
-
-        return reward
-
-    def fgbg_reward (self, scaler=None):
-        reward = np.zeros (self.size, dtype=np.float32)
-        foregr_ratio = self.config ["fgbg_ratio"]
-        # backgr reward, penalty
-        reward += ((self.new_lbl == 0) & (self.gt_lbl == 0)) * foregr_ratio
-        reward -= ((self.new_lbl != 0) & (self.gt_lbl == 0)) * foregr_ratio
-        # foregr reward, penalty
-        reward += ((self.new_lbl != 0) & (self.gt_lbl != 0)) * (1 - foregr_ratio)
-        reward -= ((self.new_lbl == 0) & (self.gt_lbl != 0)) * (1 - foregr_ratio)
-
-        return reward
-
-    def background_reward (self, last_step):
-        reward = np.zeros (self.size, dtype=np.float32)
-        foregr_ratio = self.config ["fgbg_ratio"]
-        if last_step:
-            reward += ((self.new_lbl == 0) & (self.gt_lbl == 0)) * foregr_ratio
-        reward -= ((self.new_lbl != 0) & (self.lbl == 0) & (self.gt_lbl == 0)) * foregr_ratio
-
-        return reward   
-    
-    def foreground_reward (self, last_step):
-        reward = np.zeros (self.size, dtype=np.float32)
-        foregr_ratio = self.config ["fgbg_ratio"]
-        reward += ((self.new_lbl != 0) & (self.lbl == 0) & (self.gt_lbl != 0)) * (1 - foregr_ratio)
-        if last_step:
-            reward -= ((self.new_lbl == 0) & (self.gt_lbl != 0)) * (1 - foregr_ratio)
-
-        return reward
-
     def observation (self):
-        lbl = self.lbl / self.max_lbl * 255.0
-        done_mask = np.zeros (self.size, dtype=np.float32)
-        if self.step_cnt >= self.T:
-            done_mask += 255.0
+        # Observation matrix of shape CxHxW or CxHxWxD
+        # C = T + len ([raw, supix_mask])
+
+        # Map to nD image then normalize the base-10 predicted label to [0-1]
+        lbl = self.rag.vec2img (self.lbl) / self.max_lbl * 255.0
+
+        #TODO: use a generic data definition
+        # Add [raw image, over-segmentation boundary map, coloring mask] to the observation
         if self.config ["data_chan"] == 1:
-            obs = [self.raw [None].astype (np.float32), done_mask [None]]
+            obs = [self.raw [None].astype (np.float32)]
         elif self.config ["data_chan"] == 3:
-            obs = [np.transpose (self.raw.astype (np.float32), [2, 0, 1]), done_mask [None]]
-        if self.config ["use_lbl"]:
-            obs.append (lbl [None])
-        if self.config ["use_masks"]:
-            obs.append (self.mask)
+            obs = [np.transpose (self.raw.astype (np.float32), [2, 0, 1])]
+
+        obs.append (np.transpose (self.rag.boundary_map, [2, 0, 1]) * 255.0)
+        obs.append (self.mask)
 
         obs = np.concatenate (obs, 0)
 
+        ''' Range of obs elemnents:
+            raw image: [0,1]
+            oversegmentation boundary map: [0, 1]
+            coloring mask: [-1, 1]
+        '''
         return obs / 255.0
 
-    def render (self):
-        index = len (self.raw) // 2
+    def visualize (self):
+        # Return a visualization of the states and rewards of size H'xW'x3 [0-255]
 
+        # Get the data to a temporary variable
         if self.is3D:
+            # If using 3D volume data -> visualize the middle slice
+            index = len (self.raw) // 2
             tmp_raw = self.raw [index]
             tmp_lbl = self.lbl [index]
             tmp_gt_lbl = self.gt_lbl [index]
@@ -407,18 +277,23 @@ class General_env (gym.Env):
             tmp_lbl = self.lbl
             tmp_gt_lbl = self.gt_lbl
 
+        #TODO: Define a generic/abstract datatype (3d/4d)
+        #Convert to RGB image HxWx3
         if self.config ["data_chan"] == 1:
             raw = np.repeat (np.expand_dims (tmp_raw, -1), 3, -1).astype (np.uint8)
         elif self.config ["data_chan"] == 3:
             raw = tmp_raw
 
-        lbl = tmp_lbl.astype (np.int32)
+        # Map to nD image then convert the base-10 predicted label to RGB
+        lbl = self.rag.vec2img (tmp_lbl.astype (np.int32))
         lbl = self.pred_lbl2rgb (lbl)
 
+        # Convert base-10 groundtruth label to RGB
         gt_lbl = tmp_gt_lbl % 111
         gt_lbl += ((gt_lbl == 0) & (tmp_gt_lbl != 0))
         gt_lbl = self.gt_lbl2rgb (gt_lbl)
         
+        # Convert base-k label mask to RGB, stacking horizontal
         masks = []
         for i in range (self.T):
             if self.is3D:
@@ -428,10 +303,16 @@ class General_env (gym.Env):
             mask_i = np.repeat (np.expand_dims (mask_i, -1), 3, -1).astype (np.uint8)
             masks.append (mask_i)
 
+        #TODO: Define concrete max reward function
         max_reward = 7
 
+        # Normalize reward stack to [0-1] and convert reward map to RGB [HxW]     
         rewards = []
+
+        # Stacking horizontal, add a sum of all reward in the front (T+1 HxW maps)
         for reward_i in [self.sum_reward] + self.rewards:
+            # Map to nD image
+            reward_i = self.rag.vec2img (reward_i)
             if self.is3D:
                 reward_i = reward_i [index]
             reward_i = ((reward_i + max_reward) / (2 * max_reward) * 255).astype (np.uint8) 
@@ -439,9 +320,13 @@ class General_env (gym.Env):
             reward_i = np.repeat (np.expand_dims (reward_i, -1), 3, -1)
             rewards.append (reward_i)
 
+        # Append the undecided reward information (0s valued) Hx(T+1)Wx3
         while (len (rewards) < self.T + 1):
             rewards.append (np.zeros_like (rewards [0]))
 
+        # Convert the split/merge ratio effectiveness of decisions to RGB
+        split_ratio_sum = self.rag.vec2img (self.split_ratio_sum)
+        merge_ratio_sum = self.rag.vec2img (self.merge_ratio_sum)
         if self.is3D:
             split_ratio_sum = np.repeat (np.expand_dims ((self.split_ratio_sum [index] * 255).astype (np.uint8), -1), 3, -1)
             merge_ratio_sum = np.repeat (np.expand_dims ((self.merge_ratio_sum [index] * 255).astype (np.uint8), -1), 3, -1)
@@ -449,28 +334,29 @@ class General_env (gym.Env):
             split_ratio_sum = np.repeat (np.expand_dims ((self.split_ratio_sum * 255).astype (np.uint8), -1), 3, -1)
             merge_ratio_sum = np.repeat (np.expand_dims ((self.merge_ratio_sum * 255).astype (np.uint8), -1), 3, -1)
 
-        line1 = [raw, lbl, gt_lbl,] + masks
+        line1 = [raw, lbl, gt_lbl,] + masks # Raw image, label, groundtruth, decision maps [Hx(T+3)Wx3]
 
+        # Append merge/split ratio to begining of the rewards map list [Hx(T+3)Wx3]
         while (len (rewards) < len (line1)):
             rewards = [np.zeros_like (rewards [-1])] + rewards
 
-        rewards[0] = split_ratio_sum
-        rewards[1] = merge_ratio_sum
+        rewards[0] = self.rag.vec2img (split_ratio_sum)
+        rewards[1] = self.rag.vec2img (merge_ratio_sum)
 
         line1 = np.concatenate (line1, 1)
         line2 = np.concatenate (rewards, 1)
 
-        ret = np.concatenate ([line1, line2], 0)
+        # Final RGB image  [2Hx(T+3)Wx3]
+        ret = np.concatenate ([line1, line2], 0) 
         return ret
 
 class EM_env (General_env):
-    def __init__ (self, raw_list, config, isTrain, gt_lbl_list=None, obs_format="CHW", seed=0):
+    def __init__ (self, config, raw_list, gt_lbl_list=None, isTrain=True, seed=0):
         self.isTrain = isTrain
         self.raw_list = raw_list
         self.gt_lbl_list = gt_lbl_list
         self.rng = np.random.RandomState(seed)
         self.config = config
-        self.obs_format = obs_format
         self.init (config)
 
     def random_crop (self, size, imgs):
@@ -494,30 +380,19 @@ class EM_env (General_env):
 
         # Randomly choose a train sample
         image_idx = self.rng.randint (0, len (self.raw_list))
-        self.raw = np.copy (np.array (self.raw_list [image_idx], copy=True))
+        self.raw = np.array (self.raw_list [image_idx], copy=True)
 
         if (self.isTrain):
             self.gt_lbl = np.copy(self.gt_lbl_list [image_idx])
         else:
             self.gt_lbl = np.zeros_like (self.raw)
 
-        # For visualization of rewards matrix for merge and split, normlized to be mid value 128
-        self.split_ratio_sum = (np.zeros (self.size, dtype=np.float32) + 0.5) * (self.gt_lbl > 0)
-        self.merge_ratio_sum = (np.zeros (self.size, dtype=np.float32) + 0.5) * (self.gt_lbl > 0)
-
-        # Predict label mask T x H x W
-        self.mask = np.zeros ([self.T] + self.size, dtype=np.float32)
-        # 
-        self.lbl = np.zeros (self.size, dtype=np.int32)
-        self.sum_reward = np.zeros (self.size, dtype=np.float32)
-        self.rewards = []
-
         self.reset_end ()
         return self.observation ()
 
     def set_sample (self, idx, resize=False):
+        # Preparation for inference of a single image (no augmentation)
         self.step_cnt = 0
-        self.T0 = self.config ["T0"]
         idx = idx
         if not self.is3D:
             while (self.raw_list [idx].shape [0] < self.size [0] \

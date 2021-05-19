@@ -7,12 +7,12 @@ import copy
 import numpy as np
 
 class RAG ():
-    def __init__ (self, args, image, label, n_segments=1024, compactness=0.1):
+    def __init__ (self, args, image, label, n_segments=1024, compactness=0.1, split_r=2):
         self.image = image
         self.label = label # Indexing from 1, background is 1
         self.n_segments = n_segments
         self.compactness = compactness
-        self.split_r = args.split_r
+        self.split_r = split_r
         self.init_graph ()
         self.extend_graph ()
 
@@ -20,16 +20,20 @@ class RAG ():
          # Over segmentations
         self.segments = segmentation.slic(self.image, compactness=0.1, n_segments=self.n_segments, start_label=1)
         # Edge map from sobel filter
-        edge_map = filters.sobel(color.rgb2gray(self.image))
+        self.edge_map = filters.sobel(color.rgb2gray(self.image))
         # Region Adjacency Graph by boundary 
-        self.rag = graph.rag_boundary(self.segments, edge_map)
+        self.rag = graph.rag_boundary(self.segments, self.edge_map)
         # Get each node with properties
         self.nodes = self.rag.nodes
         self.regions = regionprops(label_image=self.segments, intensity_image=self.label)
-        self.N = len (self.nodes)
+        self.n_segments = len (self.nodes)
+
+        # Construct binary oversegment map [0, 255] (HxWx1)
+        bin_map = np.ones (self.edge_map.shape, dtype=np.uint8) * 255 
+        self.boundary_map = segmentation.mark_boundaries(bin_map, self.segments, 0) [:,:,:1]
 
         # Build adjacency edge lists
-        self.adj_edges = [[] for i in range (self.N + 1)]
+        self.adj_edges = [[] for i in range (self.n_segments + 1)]
         self.edges = []
  
         for edge in self.rag.edges:
@@ -40,25 +44,35 @@ class RAG ():
 
     def extend_graph (self):
         edges = list (self.rag.edges)
+        
+        ''' Note:
+        # region ['intensity_image'] : label map, background = 1, objects > 1
+        # region ['image'] : binary segment
+        '''
 
         # Initial mapping for each node
         self.node_colors = [0] * (np.max (self.segments) + 1)
 
-        self.N_Instances = len (np.unique (self.label))
+        lbl_ids, ins_area = np.unique (self.label, return_counts=True)
+        self.N_Instances = len (lbl_ids)
 
         # Initialize body segments list of each ground truth instance
         self.instances = [[] for i in range (self.N_Instances + 1)]
         # Initiallze body segments' affinities
         self.ins_affinities = [[] for i in range (self.N_Instances + 1)]
+        # Total area of instance
+        self.ins_area = [0 for i in range (self.N_Instances + 1)]
         # Initialize neighbor segments list of each ground truth instance
         self.neighbors = [[] for i in range (self.N_Instances + 1)]
         # Initialize neighbor segments' affinies
         self.nei_affinities = [[] for i in range (self.N_Instances + 1)]
+        # Total area of neighbor segments
+        self.nei_area = [0 for i in range (self.N_Instances + 1)]
 
         nodes = self.rag.nodes
 
-        # region ['intensity_image'] : label map, background = 1, objects > 1
-        # region ['image'] : binary segment
+        for lbl_id, area in zip (lbl_ids, ins_area):
+            self.ins_area [lbl_id] = area
 
         # Get properties from regionprop
         for region in self.regions:
@@ -90,6 +104,11 @@ class RAG ():
                 self.instances [lbl_id].append (idx)
                 self.ins_affinities [lbl_id].append (nodes[idx]['affinity'][i])
 
+        # For each instances, store the list of body segments and affinities as 1D numpy vectors
+        for lbl_id in range (self.N_Instances + 1):
+            self.instances [lbl_id] = np.array (self.instances [lbl_id])
+            self.ins_affinities [lbl_id] = np.array (self.ins_affinities [lbl_id])
+
         # Update list of neighbors for each instance
         for region in self.regions:
             # Each segment
@@ -101,17 +120,11 @@ class RAG ():
                 for aff, u in zip (node_affinity, node_instances):
                     self.neighbors [u].append (idx)
                     self.nei_affinities [u].append (aff)
-
-            # for v in self.adj_edges [idx]:
-            #     # Each instance near the super pixel
-            #     v_instances = nodes [v]['instances']
-            #     for v_instance in v_instances:
-            #         if v_instance not in node_instances:
-            #             self.neighbors [v_instance].append (idx)
-            #             self.nei_affinities [v_instance].append (1.0)
+                    self.nei_area [u] += aff * nodes [idx]['foreground_area']
 
         self.new_edges = [[] for i in range (self.N_Instances + 1)]
 
+        # For each instance, BFS to find the neighboring segments
         for ins_id, segments in enumerate (self.instances):
             # Should have no segments in ins_id = 0 (instance label >= 1)
             if (ins_id == 0):
@@ -121,6 +134,8 @@ class RAG ():
             new_edges = []
             # Distance from the segment
             distance = [0] * len (segments)
+            # Copy the segments list and cast to list 
+            segments = segments.tolist ()
 
 
             for d, u in zip (distance, segments):
@@ -136,13 +151,25 @@ class RAG ():
                         segments.append (v)
                         distance.append (d + 1)
                         new_edges.append ((u,v))
+                        self.nei_area [ins_id] += nodes [v]['foreground_area']
 
+            # Store neighbors list and affinities in 1D numpy arrays
             self.neighbors [ins_id].extend (new_neighbors)
+            self.neighbors [ins_id] = np.array (self.neighbors [ins_id])
             self.nei_affinities [ins_id].extend ([1.0] * len(new_neighbors))
+            self.nei_affinities [ins_id] = np.array (self.nei_affinities [ins_id])
+            # Store edges that connect instance to neighboring segments
             self.new_edges [ins_id].extend (new_edges)
 
+        self.nei_area = np.array (self.nei_area)
+        self.ins_area = np.array (self.nei_area)
 
 
+    def vec2img (self, values):
+        # Transform 1D vector -> 2D image
+        # values must be 1D numpy array of length of self.n_segments + 1 (segment index start from 1)
+        assert (len (values) == self.n_segments + 1)
+        return values [self.segments]
 
 
                         
