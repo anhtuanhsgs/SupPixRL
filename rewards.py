@@ -6,9 +6,26 @@ import skimage.io as io
 
 BG = 1 # Background label
 
+'''
+ Given c_index (list of color index), count the occurence / invese 
+ occurence of each index in the querrying c_segs (list of color values). 
+ TODO: unique function --> sum (area * affinity)
+'''
+def get_counts (c_segs, c_index, area, base, T):
+    # count the occurence of all possible color value, even with 0 occurence
+    nei_cnt = np.array ([0] * (base**T) + 1)
+    nei_uni = np.unique (c_segs, return_counts=True)
+
+    # Update the counts
+    nei_cnt [nei_uni [0]] = nei_uni [1]
+    # Compute the inverse count (= sum - count)
+    inv_nei_cnt = area - nei_cnt;
+    return nei_cnt [c_index].astype (np.float32, copy=False),\
+             inv_nei_cnt [c_index].astype (np.float32, copy=False)
+
 def split_reward_fn (lbl, new_lbl, rag, step_cnt, T):
-    t_spl_rew = 0
-    f_mer_pen = 0
+    t_spl_rew = np.zeros (rag.n_segments + 1, dtype=np.float32)
+    f_mer_pen = np.zeros (rag.n_segments + 1, dtype=np.float32)
 
     # For each instance, update the split reward for its inner segments
     for ins_id in range (1, len (rag.instances) + 1):
@@ -16,18 +33,35 @@ def split_reward_fn (lbl, new_lbl, rag, step_cnt, T):
         if ins_id == BG:
             continue
 
+        # nei_area = rag.nei_area [ins_id]
+        nei_area = len (rag.neighbors [ins_id])
+
         c_old = lbl [ins_id]
         c_new = new_lbl [ins_id]
 
         # List of body segments 
         segments = rag.instances [ins_id] 
-        # 
+        c_segs_old = lbl [segments]
+        c_segs_new = new_lbl [segments]
 
         # Lists of neiboring segments
         neighbors = rag.neighbors [ins_id]
+        c_neis_old = lbl [neighbors]
+        c_neis_new = new_lbl [neighbors]
 
+        # Get the color occurence of c_segs in c_neis (old and new)
+        # TODO: use segments area / affinity
+        neis_cnt_o, inv_cnt_o = get_counts (c_neis_old, c_segs_old)
+        neis_cnt_n, inv_cnt_n = get_counts (c_neis_new, c_segs_new)
 
-    return 0
+        # True split = new_split_cnt - old_split_count
+        t_spl_rew += (inv_cnt_n - inv_cnt_o) / nei_area 
+
+        # False merge = remaining_split
+        f_mer_pen += neis_cnt_n / (nei_area * T)
+    
+    ret = t_spl_rew - f_mer_pen
+    return ret
 
 def merge_reward_fn (lbl, new_lbl, rag, step_cnt, T):
     t_mer_rew = 0

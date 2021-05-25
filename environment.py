@@ -177,10 +177,10 @@ class General_env ():
 
 
         # Update split rewards
-        split_reward += split_reward_fn (self.lbl, self.new_lbl, self.rag, self.step_cnt, self.T)
+        split_reward += split_reward_fn (self.lbl, self.new_lbl, self.rag, self.step_cnt, self.base, self.T)
 
         # Update merge rewards
-        merge_reward += merge_reward_fn (self.lbl, self.new_lbl, self.rag, self.step_cnt, self.T)
+        merge_reward += merge_reward_fn (self.lbl, self.new_lbl, self.rag, self.step_cnt, self.base, self.T)
 
         reward += self.config ["spl_w"] * split_reward + self.config ["mer_w"] * merge_reward #+ split_reward * merge_reward`
         merge_ratio += merge_reward / range_merge 
